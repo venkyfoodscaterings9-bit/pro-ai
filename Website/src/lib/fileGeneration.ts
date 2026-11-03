@@ -166,10 +166,6 @@ async function csvText(file: GeneratedFile): Promise<string> {
   return `\ufeff${rows.join("\r\n")}`;
 }
 
-function markdownParagraphs(markdown: string): string[] {
-  return markdown.split(/\r?\n/).map((line) => line.replace(/^#{1,6}\s*/, "").replace(/^\s*[-*+]\s+/, "• ").trim()).filter(Boolean);
-}
-
 function docxBlob(file: GeneratedFile): Blob {
   const lines = file.content.split(/\r?\n/);
   const body: string[] = [];
