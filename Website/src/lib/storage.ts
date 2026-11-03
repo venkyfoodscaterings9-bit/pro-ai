@@ -1,19 +1,20 @@
 import type {
   AppSettings,
   Chat,
+  CustomProvider,
   EncryptedApiKey,
   Project,
   VaultMetadata,
 } from "../types";
-import { getProvider } from "./providers";
 
 const DATABASE_NAME = "morrow-chat";
-const DATABASE_VERSION = 2;
+const DATABASE_VERSION = 3;
 const STORES = {
   chats: "chats",
   projects: "projects",
   keys: "encrypted-api-keys",
   settings: "settings",
+  providers: "custom-providers",
 } as const;
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -45,6 +46,9 @@ function openDatabase(): Promise<IDBDatabase> {
       }
       if (!database.objectStoreNames.contains(STORES.settings)) {
         database.createObjectStore(STORES.settings, { keyPath: "id" });
+      }
+      if (!database.objectStoreNames.contains(STORES.providers)) {
+        database.createObjectStore(STORES.providers, { keyPath: "id" });
       }
     };
     request.onsuccess = () => {
@@ -106,13 +110,7 @@ export async function getChats(): Promise<Chat[]> {
   const savedChats = await requestValue<Array<Record<string, unknown>>>(STORES.chats, (store) => store.getAll());
   const chats = savedChats.map((value) => {
     const messages = Array.isArray(value.messages) ? value.messages : [];
-    const provider = typeof value.provider === "string" ? value.provider : "gemini";
-    let safeProvider: Chat["provider"] = "gemini";
-    try {
-      safeProvider = getProvider(provider as Chat["provider"]).id;
-    } catch {
-      safeProvider = "gemini";
-    }
+    const safeProvider = typeof value.provider === "string" ? value.provider : "gemini";
     return {
       ...value,
       provider: safeProvider,
@@ -180,6 +178,19 @@ export function saveEncryptedKey(key: EncryptedApiKey): Promise<void> {
 
 export function removeEncryptedKey(id: string): Promise<void> {
   return writeValue(STORES.keys, (store) => store.delete(id));
+}
+
+export async function getCustomProviders(): Promise<CustomProvider[]> {
+  const providers = await requestValue<CustomProvider[]>(STORES.providers, (store) => store.getAll());
+  return providers.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function saveCustomProvider(provider: CustomProvider): Promise<void> {
+  return writeValue(STORES.providers, (store) => store.put(provider));
+}
+
+export function removeCustomProvider(id: string): Promise<void> {
+  return writeValue(STORES.providers, (store) => store.delete(id));
 }
 
 export async function getAppSettings(): Promise<AppSettings> {

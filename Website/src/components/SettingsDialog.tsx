@@ -12,17 +12,22 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
+import ModelsProvidersSettings from "./ModelsProvidersSettings";
+import { getSelectableModelGroups } from "../lib/modelCatalog";
 import { getProvider, PROVIDERS } from "../lib/providers";
 import { outputPreferenceOptions } from "../lib/smartOutput";
 import type {
   AppSettings,
+  CustomModel,
+  CustomProvider,
   EncryptedApiKey,
+  ImportedCustomProvider,
   ProviderId,
   Theme,
   VaultMetadata,
 } from "../types";
 
-type SettingsTab = "general" | "keys";
+type SettingsTab = "general" | "keys" | "providers";
 
 interface KeyForm {
   id?: string;
@@ -33,6 +38,7 @@ interface KeyForm {
 
 interface SettingsDialogProps {
   settings: AppSettings;
+  customProviders: CustomProvider[];
   keys: EncryptedApiKey[];
   vaultMetadata: VaultMetadata | null;
   vaultUnlocked: boolean;
@@ -47,10 +53,17 @@ interface SettingsDialogProps {
   onDeleteKey: (key: EncryptedApiKey) => Promise<void>;
   onExport: () => Promise<void>;
   onWipe: () => Promise<void>;
+  onSaveCustomProvider: (provider: CustomProvider, apiKey: string) => Promise<void>;
+  onDeleteCustomProvider: (provider: CustomProvider) => Promise<void>;
+  onTestCustomProvider: (provider: CustomProvider, model: CustomModel, apiKey: string) => Promise<void>;
+  onFetchCustomModels: (provider: CustomProvider, apiKey: string) => Promise<Array<{ id: string; name: string }>>;
+  onImportCustomProviders: (providers: ImportedCustomProvider[]) => Promise<void>;
+  onExportCustomProviders: (includeApiKeys: boolean) => Promise<void>;
 }
 
 export default function SettingsDialog({
   settings,
+  customProviders,
   keys,
   vaultMetadata,
   vaultUnlocked,
@@ -65,6 +78,12 @@ export default function SettingsDialog({
   onDeleteKey,
   onExport,
   onWipe,
+  onSaveCustomProvider,
+  onDeleteCustomProvider,
+  onTestCustomProvider,
+  onFetchCustomModels,
+  onImportCustomProviders,
+  onExportCustomProviders,
 }: SettingsDialogProps) {
   const [tab, setTab] = useState<SettingsTab>(initialTab);
   const [draftSettings, setDraftSettings] = useState(settings);
@@ -155,6 +174,9 @@ export default function SettingsDialog({
           <button className={tab === "keys" ? "settings-tab settings-tab-active" : "settings-tab"} onClick={() => { setTab("keys"); setError(""); setNotice(""); }} role="tab" aria-selected={tab === "keys"}>
             <KeyRound size={14} /> API keys <span className="key-count">{keys.length}</span>
           </button>
+          <button className={tab === "providers" ? "settings-tab settings-tab-active" : "settings-tab"} onClick={() => { setTab("providers"); setError(""); setNotice(""); }} role="tab" aria-selected={tab === "providers"}>
+            Models &amp; Providers
+          </button>
         </div>
 
         {error && <div className="settings-feedback settings-feedback-error" role="alert">{error}</div>}
@@ -194,10 +216,10 @@ export default function SettingsDialog({
                   }));
                 }}
               >
-                {PROVIDERS.map((provider) => (
+                {getSelectableModelGroups(customProviders).map((provider) => (
                   <optgroup label={provider.name} key={provider.id}>
                     {provider.models.map((model) => (
-                      <option key={model.id} value={`${provider.id}:${model.id}`}>{model.name}</option>
+                      <option key={model.id} value={`${provider.id}:${model.modelId}`}>{model.name}</option>
                     ))}
                   </optgroup>
                 ))}
@@ -247,7 +269,7 @@ export default function SettingsDialog({
               </div>
             </section>
           </div>
-        ) : (
+        ) : tab === "keys" ? (
           <div className="settings-content">
             <section className="settings-section vault-intro">
               <div className="vault-status-icon">{vaultUnlocked ? <UnlockKeyhole size={18} /> : <LockKeyhole size={18} />}</div>
@@ -327,12 +349,42 @@ export default function SettingsDialog({
                     </div>
                   );
                 })}
+                {customProviders.map((provider) => {
+                  const providerKeys = keys.filter((item) => item.provider === provider.id);
+                  return (
+                    <div className="provider-key-group" key={provider.id}>
+                      <div className="provider-key-heading">
+                        <span className="provider-dot" style={{ backgroundColor: "#8976bd" }} />
+                        <strong>{provider.name}</strong>
+                        <span>{providerKeys.length ? "1 key" : "No key"}</span>
+                      </div>
+                      {providerKeys.map((key) => (
+                        <div className="api-key-row" key={key.id}>
+                          <div className="api-key-lock"><ShieldCheck size={15} /></div>
+                          <div className="api-key-label"><strong>{provider.name}</strong><span>Encrypted ·••••{provider.apiKeyLastFour ?? "••••"}</span></div>
+                          <button onClick={() => setTab("providers")}>Manage</button>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
               </div>
             )}
             <p className="vault-caveat">
               Encryption protects keys at rest, not against malicious scripts, browser extensions, browser compromise, or a compromised device. Keys are sent directly to the chosen provider. Direct browser requests may be blocked by provider CORS; no proxy is included.
             </p>
           </div>
+        ) : (
+          <ModelsProvidersSettings
+            providers={customProviders}
+            vaultUnlocked={vaultUnlocked}
+            onSaveProvider={onSaveCustomProvider}
+            onDeleteProvider={onDeleteCustomProvider}
+            onTestProvider={onTestCustomProvider}
+            onFetchModels={onFetchCustomModels}
+            onImport={onImportCustomProviders}
+            onExport={onExportCustomProviders}
+          />
         )}
 
         <div className="settings-footer">

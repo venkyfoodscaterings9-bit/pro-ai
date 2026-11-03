@@ -1,4 +1,5 @@
-export type ProviderId = "anthropic" | "openai" | "gemini" | "groq" | "openrouter" | "mistral";
+export type ProviderId = string;
+export type ApiFormat = "openai" | "anthropic" | "gemini";
 export type MessageRole = "user" | "assistant";
 export type Theme = "light" | "dark";
 export type AttachmentKind = "image" | "text";
@@ -10,6 +11,31 @@ export interface ModelOption {
   name: string;
   provider: ProviderId;
   vision?: boolean;
+}
+
+export interface CustomModel {
+  id: string;
+  modelId: string;
+  displayName: string;
+  maxTokens?: number;
+  temperature?: number;
+  vision: boolean;
+  streaming: boolean;
+  enabled: boolean;
+}
+
+export interface CustomProvider {
+  id: ProviderId;
+  name: string;
+  baseUrl: string;
+  apiFormat: ApiFormat;
+  enabled: boolean;
+  models: CustomModel[];
+  apiKeyLastFour?: string;
+}
+
+export interface ImportedCustomProvider extends Omit<CustomProvider, "apiKeyLastFour"> {
+  apiKey?: string;
 }
 
 export interface ProviderOption {
@@ -85,6 +111,8 @@ export interface AppSettings {
   theme: Theme;
   defaultProvider: ProviderId;
   defaultModel: string;
+  lastSelectedProvider?: ProviderId;
+  lastSelectedModel?: string;
   customInstructions: string;
   defaultOutputFormat: OutputFormatPreference;
   alwaysAskOutputFormat: boolean;

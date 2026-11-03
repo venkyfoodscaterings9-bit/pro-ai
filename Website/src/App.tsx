@@ -34,8 +34,11 @@ import ProjectsPage from "./components/ProjectsPage";
 import SettingsDialog from "./components/SettingsDialog";
 import { attachmentPreviewUrl, readAttachments } from "./lib/files";
 import { buildBackupJson, chatAsMarkdown, downloadTextFile } from "./lib/exports";
+import { fetchCustomModels, lastFour, requestCustomProvider, testCustomProvider, CustomProviderRequestError } from "./lib/customProviderApi";
 import { buildFileBlob } from "./lib/fileGeneration";
-import { getDefaultModel, getModel, getProvider, modelHasVision, PROVIDERS, ProviderRequestError, streamProviderResponse } from "./lib/providers";
+import { getDefaultModel, getProvider, modelHasVision, PROVIDERS, ProviderRequestError, streamProviderResponse } from "./lib/providers";
+import { getChatModel, getProviderColor, getProviderName, getSelectableModelGroups } from "./lib/modelCatalog";
+import { normalizeBaseUrl } from "./lib/providerUrl";
 import {
   buildOutputInstruction,
   fileLabel,
@@ -53,14 +56,17 @@ import {
   exportLocalBackup,
   getAppSettings,
   getChats,
+  getCustomProviders,
   getEncryptedKeys,
   getProjects,
   getVaultMetadata,
   removeChat,
+  removeCustomProvider as removeCustomProviderFromStorage,
   removeEncryptedKey,
   removeProject,
   saveAppSettings,
   saveChat,
+  saveCustomProvider as persistCustomProvider,
   saveEncryptedKey,
   saveProject as persistProject,
   saveVaultMetadata,
@@ -68,12 +74,15 @@ import {
 import { createVault as initializeVault, decryptApiKey, encryptApiKey, unlockVault } from "./lib/vault";
 import type {
   AppSettings,
+  CustomModel,
+  CustomProvider,
   Artifact,
   Chat,
   ChatAttachment,
   ChatMessage,
   EncryptedApiKey,
   GeneratedFile,
+  ImportedCustomProvider,
   OutputFormat,
   OutputFormatPreference,
   Project,
@@ -89,7 +98,7 @@ const SUGGESTIONS = [
   { title: "Learn something new", prompt: "Teach me the basics of " },
 ];
 
-type SettingsTab = "general" | "keys";
+type SettingsTab = "general" | "keys" | "providers";
 type AppPage = "chat" | "projects" | "files";
 
 interface RequestAttempt {
@@ -114,8 +123,8 @@ function createChat(settings: AppSettings, projectId?: string): Chat {
     messages: [],
     pinned: false,
     updatedAt: Date.now(),
-    provider: settings.defaultProvider,
-    model: settings.defaultModel,
+    provider: settings.lastSelectedProvider ?? settings.defaultProvider,
+    model: settings.lastSelectedModel ?? settings.defaultModel,
     ...(projectId ? { projectId } : {}),
   };
 }
@@ -128,10 +137,11 @@ function isAbortError(cause: unknown): boolean {
 
 function errorText(cause: unknown, provider: ProviderId): string {
   if (cause instanceof ProviderRequestError) return cause.message;
+  if (cause instanceof CustomProviderRequestError) return cause.message;
   if (cause instanceof TypeError) {
-    return `${getProvider(provider).name} could not be reached directly. Your network or browser may block this request (CORS). No proxy is configured.`;
+    return `${provider} could not be reached directly. Your network or browser may block this request (CORS). No proxy is configured.`;
   }
-  return cause instanceof Error ? cause.message : `${getProvider(provider).name} request failed.`;
+  return cause instanceof Error ? cause.message : `${provider} request failed.`;
 }
 
 function makeAttempts(
@@ -172,6 +182,7 @@ export default function App() {
   const chatsRef = useRef<Chat[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [keys, setKeys] = useState<EncryptedApiKey[]>([]);
+  const [customProviders, setCustomProviders] = useState<CustomProvider[]>([]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [vaultMetadata, setVaultMetadata] = useState<VaultMetadata | null>(null);
   const [vaultKey, setVaultKey] = useState<CryptoKey | null>(null);
@@ -208,13 +219,14 @@ export default function App() {
   const startNewChatRef = useRef<() => void>(() => {});
 
   const activeChat = chats.find((chat) => chat.id === activeChatId) ?? null;
-  const currentProvider = activeChat?.provider ?? settings.defaultProvider;
-  const currentModel = activeChat?.model ?? settings.defaultModel;
+  const currentProvider = activeChat?.provider ?? settings.lastSelectedProvider ?? settings.defaultProvider;
+  const currentModel = activeChat?.model ?? settings.lastSelectedModel ?? settings.defaultModel;
+  const modelGroups = useMemo(() => getSelectableModelGroups(customProviders), [customProviders]);
   const activeModel = (() => {
     try {
-      return getModel(currentProvider, currentModel);
+      return getChatModel(currentProvider, currentModel, customProviders);
     } catch {
-      return getDefaultModel(settings.defaultProvider);
+      return getChatModel("gemini", getDefaultModel("gemini").id, customProviders);
     }
   })();
   const isStreaming = streamingChatId !== null;
@@ -229,8 +241,8 @@ export default function App() {
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([getChats(), getProjects(), getEncryptedKeys(), getAppSettings(), getVaultMetadata()])
-      .then(([savedChats, savedProjects, savedKeys, savedSettings, metadata]) => {
+    Promise.all([getChats(), getProjects(), getEncryptedKeys(), getAppSettings(), getVaultMetadata(), getCustomProviders()])
+      .then(([savedChats, savedProjects, savedKeys, savedSettings, metadata, savedCustomProviders]) => {
         if (!mounted) return;
         chatsRef.current = savedChats;
         setChats(savedChats);
@@ -238,6 +250,7 @@ export default function App() {
         setKeys(savedKeys);
         setSettings(savedSettings);
         setVaultMetadata(metadata);
+        setCustomProviders(savedCustomProviders);
         setSettingsReady(true);
       })
       .catch((cause: unknown) => {
@@ -355,7 +368,14 @@ export default function App() {
   startNewChatRef.current = startNewChat;
 
   async function saveSettings(next: AppSettings) {
-    const updated = { ...next, updatedAt: Date.now() };
+    const defaultChanged = next.defaultProvider !== settings.defaultProvider || next.defaultModel !== settings.defaultModel;
+    const updated = {
+      ...next,
+      ...(defaultChanged
+        ? { lastSelectedProvider: next.defaultProvider, lastSelectedModel: next.defaultModel }
+        : {}),
+      updatedAt: Date.now(),
+    };
     await saveAppSettings(updated);
     setSettings(updated);
   }
@@ -415,6 +435,185 @@ export default function App() {
     setKeys((current) => current.filter((item) => item.id !== key.id));
   }
 
+  async function saveCustomProvider(provider: CustomProvider, plaintextKey: string) {
+    const savedProvider = customProviders.find((item) => item.id === provider.id);
+    const normalized: CustomProvider = {
+      ...provider,
+      name: provider.name.trim(),
+      baseUrl: normalizeBaseUrl(provider.baseUrl),
+      ...(provider.apiKeyLastFour || savedProvider?.apiKeyLastFour
+        ? { apiKeyLastFour: provider.apiKeyLastFour ?? savedProvider?.apiKeyLastFour }
+        : {}),
+      models: provider.models.map((model) => ({
+        ...model,
+        modelId: model.modelId.trim(),
+        displayName: model.displayName.trim() || model.modelId.trim(),
+      })),
+    };
+    if (!normalized.name) throw new Error("Enter a provider name.");
+    if (!normalized.models.every((model) => model.modelId)) throw new Error("Every model must have a model ID.");
+    const existingKey = keys.find((key) => key.provider === normalized.id);
+    if (plaintextKey.trim()) {
+      if (!vaultKey) throw new Error("Unlock the encrypted key vault in Settings → API keys before saving this API key.");
+      const encrypted = await encryptApiKey(vaultKey, {
+        id: existingKey?.id ?? makeId(),
+        provider: normalized.id,
+        label: normalized.name,
+        apiKey: plaintextKey,
+        createdAt: existingKey?.createdAt,
+        lastUsedAt: existingKey?.lastUsedAt,
+      });
+      await saveEncryptedKey(encrypted);
+      setKeys((current) => current.some((item) => item.id === encrypted.id)
+        ? current.map((item) => item.id === encrypted.id ? encrypted : item)
+        : [...current, encrypted]);
+    } else if (!existingKey && !savedProvider) {
+      throw new Error("This provider has no saved API key. Enter a key before saving.");
+    }
+    await persistCustomProvider(normalized);
+    setCustomProviders((current) => current.some((item) => item.id === normalized.id)
+      ? current.map((item) => item.id === normalized.id ? normalized : item).sort((a, b) => a.name.localeCompare(b.name))
+      : [...current, normalized].sort((a, b) => a.name.localeCompare(b.name)));
+    const defaultModelStillAvailable = normalized.enabled
+      && normalized.models.some((model) => model.enabled && model.modelId === settings.defaultModel);
+    const lastModelStillAvailable = normalized.enabled
+      && normalized.models.some((model) => model.enabled && model.modelId === settings.lastSelectedModel);
+    const resetDefault = settings.defaultProvider === normalized.id && !defaultModelStillAvailable;
+    const resetLast = settings.lastSelectedProvider === normalized.id && !lastModelStillAvailable;
+    if (resetDefault || resetLast) {
+      const fallbackModel = getDefaultModel("gemini");
+      const updatedSettings = {
+        ...settings,
+        ...(resetDefault
+          ? { defaultProvider: fallbackModel.provider, defaultModel: fallbackModel.id }
+          : {}),
+        ...(resetLast
+          ? { lastSelectedProvider: fallbackModel.provider, lastSelectedModel: fallbackModel.id }
+          : {}),
+        updatedAt: Date.now(),
+      };
+      await saveAppSettings(updatedSettings);
+      setSettings(updatedSettings);
+    }
+  }
+
+  async function deleteCustomProvider(provider: CustomProvider) {
+    await Promise.all(keys.filter((key) => key.provider === provider.id).map((key) => removeEncryptedKey(key.id)));
+    await removeCustomProviderFromStorage(provider.id);
+    setKeys((current) => current.filter((key) => key.provider !== provider.id));
+    setCustomProviders((current) => current.filter((item) => item.id !== provider.id));
+    if (settings.defaultProvider === provider.id || settings.lastSelectedProvider === provider.id) {
+      const next = {
+        ...settings,
+        ...(settings.defaultProvider === provider.id
+          ? { defaultProvider: "gemini", defaultModel: getDefaultModel("gemini").id }
+          : {}),
+        ...(settings.lastSelectedProvider === provider.id
+          ? { lastSelectedProvider: "gemini", lastSelectedModel: getDefaultModel("gemini").id }
+          : {}),
+        updatedAt: Date.now(),
+      };
+      await saveAppSettings(next);
+      setSettings(next);
+    }
+  }
+
+  async function getCustomApiKey(provider: CustomProvider, enteredKey = ""): Promise<string> {
+    if (enteredKey.trim()) return enteredKey.trim();
+    if (!vaultKey) throw new Error("Unlock the API key vault in Settings → API keys to use this provider.");
+    const key = keys.find((item) => item.provider === provider.id);
+    if (!key) throw new Error(`No API key is saved for ${provider.name}. Edit the provider and add its key.`);
+    return decryptApiKey(vaultKey, key);
+  }
+
+  async function testCustomProviderConnection(provider: CustomProvider, model: CustomModel, enteredKey: string) {
+    const apiKey = await getCustomApiKey(provider, enteredKey);
+    await testCustomProvider(provider, model, apiKey);
+  }
+
+  async function fetchModelsForProvider(provider: CustomProvider, enteredKey: string) {
+    const apiKey = await getCustomApiKey(provider, enteredKey);
+    return fetchCustomModels(provider, apiKey);
+  }
+
+  async function exportCustomProviderConfig(includeApiKeys: boolean) {
+    const key = vaultKey;
+    if (includeApiKeys && !key) {
+      throw new Error("Unlock the API key vault in Settings → API keys before exporting API keys.");
+    }
+    const exported = await Promise.all(customProviders.map(async (provider) => {
+      if (!includeApiKeys) return provider;
+      const apiKeyRecord = keys.find((key) => key.provider === provider.id);
+      return apiKeyRecord && key
+        ? { ...provider, apiKey: await decryptApiKey(key, apiKeyRecord) }
+        : provider;
+    }));
+    downloadTextFile(
+      `morrow-providers-${new Date().toISOString().slice(0, 10)}.json`,
+      JSON.stringify({ format: "morrow-custom-providers-v1", exportedAt: new Date().toISOString(), providers: exported }, null, 2),
+      "application/json;charset=utf-8",
+    );
+  }
+
+  async function importCustomProviderConfig(imported: ImportedCustomProvider[]) {
+    if (!Array.isArray(imported) || !imported.length) throw new Error("The configuration file contains no providers.");
+    const seenIds = new Set<string>();
+    const normalized = imported.map((item) => {
+      if (!item || typeof item !== "object") throw new Error("The configuration contains an invalid provider.");
+      if (typeof item.name !== "string" || !item.name.trim()) throw new Error("Every imported provider needs a name.");
+      if (typeof item.baseUrl !== "string") throw new Error(`Enter a base URL for ${item.name}.`);
+      if (!["openai", "anthropic", "gemini"].includes(item.apiFormat)) throw new Error(`Unsupported API format for ${item.name}.`);
+      if (!Array.isArray(item.models)) throw new Error(`The models list for ${item.name} is invalid.`);
+      const id = typeof item.id === "string" && /^custom-[A-Za-z0-9-]+$/.test(item.id) ? item.id : `custom-${makeId()}`;
+      if (seenIds.has(id)) throw new Error("The configuration contains duplicate provider IDs.");
+      seenIds.add(id);
+      const modelIds = new Set<string>();
+      const models = item.models.map((model) => {
+        if (!model || typeof model.modelId !== "string" || !model.modelId.trim()) {
+          throw new Error(`Every model in ${item.name} needs a model ID.`);
+        }
+        const modelId = model.modelId.trim();
+        if (modelIds.has(modelId)) throw new Error(`The provider ${item.name} contains a duplicate model ID.`);
+        modelIds.add(modelId);
+        return {
+          id: typeof model.id === "string" && /^model-[A-Za-z0-9-]+$/.test(model.id) ? model.id : `model-${makeId()}`,
+          modelId,
+          displayName: typeof model.displayName === "string" && model.displayName.trim() ? model.displayName.trim() : modelId,
+          ...(typeof model.maxTokens === "number" && Number.isInteger(model.maxTokens) && model.maxTokens > 0 ? { maxTokens: model.maxTokens } : {}),
+          ...(typeof model.temperature === "number" && Number.isFinite(model.temperature) && model.temperature >= 0 && model.temperature <= 2 ? { temperature: model.temperature } : {}),
+          vision: Boolean(model.vision),
+          streaming: model.streaming !== false,
+          enabled: model.enabled !== false,
+        };
+      });
+      return {
+        provider: {
+          id,
+          name: item.name.trim(),
+          baseUrl: normalizeBaseUrl(item.baseUrl),
+          apiFormat: item.apiFormat,
+          enabled: item.enabled !== false,
+          models,
+          ...(typeof item.apiKey === "string" && item.apiKey.trim() ? { apiKeyLastFour: lastFour(item.apiKey.trim()) } : {}),
+        } satisfies CustomProvider,
+        apiKey: typeof item.apiKey === "string" ? item.apiKey : "",
+      };
+    });
+    if (normalized.some((item) => item.apiKey) && !vaultKey) {
+      throw new Error("Unlock the API key vault in Settings → API keys before importing API keys.");
+    }
+    for (const item of normalized) {
+      if (item.apiKey || customProviders.some((provider) => provider.id === item.provider.id)) {
+        await saveCustomProvider(item.provider, item.apiKey);
+      } else {
+        await persistCustomProvider(item.provider);
+        setCustomProviders((current) => current.some((provider) => provider.id === item.provider.id)
+          ? current.map((provider) => provider.id === item.provider.id ? item.provider : provider)
+          : [...current, item.provider]);
+      }
+    }
+  }
+
   async function exportBackup() {
     const backup = await exportLocalBackup();
     downloadTextFile(
@@ -431,6 +630,7 @@ export default function App() {
     setChats([]);
     setProjects([]);
     setKeys([]);
+    setCustomProviders([]);
     setVaultMetadata(null);
     setVaultKey(null);
     setSettings(DEFAULT_SETTINGS);
@@ -466,15 +666,21 @@ export default function App() {
   async function handleModelChange(provider: ProviderId, model: string) {
     setModelPickerOpen(false);
     setError("");
-    if (activeChat) {
-      updateChat(activeChat.id, (chat) => ({ ...chat, provider, model, updatedAt: Date.now() }));
-      return;
-    }
-    const selected = { ...settings, defaultProvider: provider, defaultModel: model, updatedAt: Date.now() };
+    const selected = {
+      ...settings,
+      ...(activeChat ? {} : { defaultProvider: provider, defaultModel: model }),
+      lastSelectedProvider: provider,
+      lastSelectedModel: model,
+      updatedAt: Date.now(),
+    };
     setSettings(selected);
     saveAppSettings(selected).catch((cause: unknown) => {
       setStorageError(cause instanceof Error ? cause.message : "Could not save the selected model.");
     });
+    if (activeChat) {
+      updateChat(activeChat.id, (chat) => ({ ...chat, provider, model, updatedAt: Date.now() }));
+      return;
+    }
   }
 
   async function markKeyAttempted(key: EncryptedApiKey) {
@@ -520,11 +726,31 @@ export default function App() {
       : null) ?? createChat(settings);
     const provider = current.provider;
     const model = current.model;
-    if (attachments.some((item) => item.kind === "image") && !modelHasVision(provider, model)) {
-      setError(`${getModel(provider, model).name} does not accept image input. Choose a vision-capable model first.`);
+    const customProvider = customProviders.find((item) => item.id === provider);
+    let selectedModel: ReturnType<typeof getChatModel>;
+    try {
+      selectedModel = getChatModel(provider, model, customProviders);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Choose a configured model before sending.");
+      return;
+    }
+    const customModel = customProvider?.models.find((item) => item.modelId === model);
+    if (customProvider && (!customProvider.enabled || !customModel?.enabled)) {
+      setError("This provider or model is disabled. Choose an enabled model or update its settings.");
+      return;
+    }
+    if (attachments.some((item) => item.kind === "image") && !selectedModel.vision) {
+      setError(`${selectedModel.name} does not accept image input. Choose a vision-capable model first.`);
       return;
     }
     const providerKeys = keys.filter((key) => key.provider === provider);
+    if (customProvider && !providerKeys.length) {
+      setSettingsOpen(true);
+      setSettingsTab("providers");
+      setSettingsNotice(`Add an API key to ${customProvider.name} before sending a message.`);
+      setError(`No API key is saved for ${customProvider.name}.`);
+      return;
+    }
     if (!providerKeys.length && keys.length === 0) {
       setSettingsOpen(true);
       setSettingsTab("keys");
@@ -584,8 +810,41 @@ export default function App() {
     const hasImages = [...priorMessages, userMessage].some((message) =>
       message.attachments?.some((attachment) => attachment.kind === "image"),
     );
-    const attempts = makeAttempts(provider, model, keys, hasImages);
+    const attempts = customProvider
+      ? providerKeys.map((key) => ({ provider, model, key }))
+      : makeAttempts(provider, model, keys, hasImages);
     const controller = new AbortController();
+    const requestProvider = (
+      attempt: RequestAttempt,
+      apiKey: string,
+      requestMessages: ProviderMessage[],
+      requestSystemPrompt: string,
+      onText: (chunk: string) => void,
+    ) => {
+      const custom = customProviders.find((item) => item.id === attempt.provider);
+      if (custom) {
+        const requestModel = custom.models.find((item) => item.modelId === attempt.model);
+        if (!requestModel) throw new Error(`The model ${attempt.model} is no longer configured for ${custom.name}.`);
+        return requestCustomProvider({
+          provider: custom,
+          model: requestModel,
+          apiKey,
+          messages: requestMessages,
+          systemPrompt: requestSystemPrompt,
+          signal: controller.signal,
+          onText,
+        });
+      }
+      return streamProviderResponse({
+        provider: attempt.provider,
+        model: attempt.model,
+        apiKey,
+        messages: requestMessages,
+        systemPrompt: requestSystemPrompt,
+        signal: controller.signal,
+        onText,
+      });
+    };
     abortRef.current = controller;
     let responseText = "";
     let responseContent = "";
@@ -605,30 +864,23 @@ export default function App() {
         if (failedProviders.get(attempt.provider) === false) continue;
         if (activeAttemptProvider !== attempt.provider) {
           if (activeAttemptProvider) {
-            setGenerationStatus(`Trying ${getProvider(attempt.provider).name} after ${getProvider(activeAttemptProvider).name} could not respond…`);
+            setGenerationStatus(`Trying ${getProviderName(attempt.provider, customProviders)} after ${getProviderName(activeAttemptProvider, customProviders)} could not respond…`);
           } else if (attempt.provider !== provider) {
             setGenerationStatus(providerKeys.length
-              ? `Trying ${getProvider(attempt.provider).name} as a fallback…`
-              : `No ${getProvider(provider).name} key is saved. Trying ${getProvider(attempt.provider).name}…`);
+              ? `Trying ${getProviderName(attempt.provider, customProviders)} as a fallback…`
+              : `No ${getProviderName(provider, customProviders)} key is saved. Trying ${getProviderName(attempt.provider, customProviders)}…`);
           } else if (attempt.model !== model) {
-            setGenerationStatus(`${getModel(provider, model).name} cannot accept these images. Trying ${getModel(provider, attempt.model).name}…`);
+            setGenerationStatus(`${getChatModel(provider, model, customProviders).name} cannot accept these images. Trying ${getChatModel(provider, attempt.model, customProviders).name}…`);
           }
           activeAttemptProvider = attempt.provider;
         } else {
-          setGenerationStatus(`Trying another saved ${getProvider(attempt.provider).name} key…`);
+          setGenerationStatus(`Trying another saved ${getProviderName(attempt.provider, customProviders)} key…`);
         }
 
         try {
           const plaintextKey = await decryptApiKey(vaultKey, attempt.key);
           await markKeyAttempted(attempt.key);
-          await streamProviderResponse({
-            provider: attempt.provider,
-            model: attempt.model,
-            apiKey: plaintextKey,
-            messages,
-            systemPrompt,
-            signal: controller.signal,
-            onText: (chunk) => {
+          const receiveText = (chunk: string) => {
               if (!responseText) setGenerationStatus("");
               responseText += chunk;
               actualProvider = attempt.provider;
@@ -646,10 +898,12 @@ export default function App() {
                     : chat));
                 }, 50);
               }
-            },
-          });
+            };
+          await requestProvider(attempt, plaintextKey, messages, systemPrompt, receiveText);
           if (!responseText.trim()) {
-            throw new ProviderRequestError(attempt.provider, `${getProvider(attempt.provider).name} returned no text for this response.`, true);
+            throw customProviders.some((item) => item.id === attempt.provider)
+              ? new CustomProviderRequestError(`${getProviderName(attempt.provider, customProviders)} returned no text for this response.`, true)
+              : new ProviderRequestError(attempt.provider, `${getProviderName(attempt.provider, customProviders)} returned no text for this response.`, true);
           }
           if (outputFormats.length) {
             const parsedOutput = parseModelOutput(responseText, outputFormats);
@@ -661,19 +915,11 @@ export default function App() {
               } catch (validationError) {
                 if (format === "xlsx" || format === "csv" || format === "chart" || format === "pptx" || format === "json") {
                   let repaired = "";
-                  await streamProviderResponse({
-                    provider: attempt.provider,
-                    model: attempt.model,
-                    apiKey: plaintextKey,
-                    messages: [
+                  await requestProvider(attempt, plaintextKey, [
                       ...messages,
                       { role: "assistant", content: responseText },
                       { role: "user", content: `Return only corrected valid JSON for the ${format} file. Do not use Markdown fences or add explanations. Repair this content:\n${body}` },
-                    ],
-                    systemPrompt: "You repair malformed JSON. Return only valid JSON with the same intended data. Do not add Markdown fences or explanatory text.",
-                    signal: controller.signal,
-                    onText: (chunk) => { repaired += chunk; },
-                  });
+                    ], "You repair malformed JSON. Return only valid JSON with the same intended data. Do not add Markdown fences or explanatory text.", (chunk) => { repaired += chunk; });
                   body = repaired.trim();
                   try {
                     validateStructuredOutput(format, body, responseText);
@@ -703,25 +949,25 @@ export default function App() {
           didComplete = true;
           if (attempt.provider !== provider) {
             fallbackMessage = providerKeys.length
-              ? `Used ${getProvider(attempt.provider).name} (${getModel(attempt.provider, attempt.model).name}) after ${getProvider(provider).name} failed before producing a response. Your selected model was not changed.`
-              : `No ${getProvider(provider).name} key was saved, so this response used ${getProvider(attempt.provider).name} (${getModel(attempt.provider, attempt.model).name}). Your selected model was not changed.`;
+              ? `Used ${getProviderName(attempt.provider, customProviders)} (${getChatModel(attempt.provider, attempt.model, customProviders).name}) after ${getProviderName(provider, customProviders)} failed before producing a response. Your selected model was not changed.`
+              : `No ${getProviderName(provider, customProviders)} key was saved, so this response used ${getProviderName(attempt.provider, customProviders)} (${getChatModel(attempt.provider, attempt.model, customProviders).name}). Your selected model was not changed.`;
           } else if (attempt.model !== model) {
-            fallbackMessage = `Used ${getModel(attempt.provider, attempt.model).name} because the selected model does not accept image input. Your selected model was not changed.`;
+            fallbackMessage = `Used ${getChatModel(attempt.provider, attempt.model, customProviders).name} because the selected model does not accept image input. Your selected model was not changed.`;
           } else if (attempt.key.id !== attempts[0]?.key.id) {
-            fallbackMessage = `Used the saved key “${attempt.key.label}” after another ${getProvider(provider).name} key failed.`;
+            fallbackMessage = `Used the saved key “${attempt.key.label}” after another ${getProviderName(provider, customProviders)} key failed.`;
           }
           break;
         } catch (cause) {
           if (isAbortError(cause) || controller.signal.aborted) break;
           finalError = errorText(cause, attempt.provider);
-          const retryable = cause instanceof ProviderRequestError ? cause.retryable : true;
+          const retryable = cause instanceof ProviderRequestError || cause instanceof CustomProviderRequestError ? cause.retryable : true;
           failedProviders.set(attempt.provider, retryable);
           if (responseText) {
             finalError = `${finalError} The provider returned a partial response, so Morrow did not retry it to avoid duplicated output.`;
             break;
           }
           if (attempts.some((item) => item.provider !== attempt.provider)) {
-            setGenerationStatus(`${getProvider(attempt.provider).name} failed before responding; checking your other saved providers…`);
+            setGenerationStatus(`${getProviderName(attempt.provider, customProviders)} failed before responding; checking your other saved providers…`);
           }
         }
       }
@@ -981,7 +1227,7 @@ export default function App() {
                 <div className="topbar-start">
                   <div className="model-picker-anchor">
                     <button className="model-picker" onClick={() => setModelPickerOpen((open) => !open)} aria-expanded={modelPickerOpen} aria-label="Choose model">
-                      <span className="provider-dot" style={{ backgroundColor: getProvider(currentProvider).color }} />
+                      <span className="provider-dot" style={{ backgroundColor: getProviderColor(currentProvider, customProviders) }} />
                       <span>{activeModel.name}</span><ChevronDown size={15} />
                     </button>
                     {modelPickerOpen && (
@@ -989,28 +1235,29 @@ export default function App() {
                         <button className="popover-scrim" aria-label="Close model picker" onClick={() => setModelPickerOpen(false)} />
                         <div className="model-popover">
                           <div className="model-popover-heading"><strong>Choose a model</strong><span>Available model IDs may change</span></div>
-                          {PROVIDERS.map((provider) => {
+                          {modelGroups.map((provider) => {
                             const providerKeys = keys.filter((key) => key.provider === provider.id);
                             return (
                               <section className="model-provider-group" key={provider.id}>
                                 <div className="model-provider-heading">
-                                  <span className="provider-dot" style={{ backgroundColor: provider.color }} />
+                                  <span className="provider-dot" style={{ backgroundColor: getProviderColor(provider.id, customProviders) }} />
                                   <span>{provider.name}</span><small>{providerKeys.length} {providerKeys.length === 1 ? "key" : "keys"}</small>
                                 </div>
                                 {provider.models.map((model) => (
                                   <button
-                                    className={provider.id === currentProvider && model.id === currentModel ? "model-option model-option-selected" : "model-option"}
-                                    key={model.id}
-                                    onClick={() => void handleModelChange(provider.id, model.id)}
+                                    className={provider.id === currentProvider && model.modelId === currentModel ? "model-option model-option-selected" : "model-option"}
+                                    key={`${provider.id}:${model.modelId}`}
+                                    onClick={() => void handleModelChange(provider.id, model.modelId)}
                                   >
                                     <span>{model.name}</span>
-                                    {provider.id === currentProvider && model.id === currentModel && <Check size={14} />}
+                                    {provider.id === currentProvider && model.modelId === currentModel && <Check size={14} />}
                                   </button>
                                 ))}
                               </section>
                             );
                           })}
                           <button className="model-add-key" onClick={() => openSettings("keys")}><Plus size={14} /> Manage provider keys</button>
+                          <button className="model-add-key" onClick={() => openSettings("providers")}><Plus size={14} /> Models &amp; Providers</button>
                         </div>
                       </>
                     )}
@@ -1032,7 +1279,7 @@ export default function App() {
                   )}
                 </div>
                 <div className="topbar-right">
-                  <span className="provider-label">{getProvider(currentProvider).name}</span>
+                  <span className="provider-label">{getProviderName(currentProvider, customProviders)}</span>
                   {activeChat && (
                     <div className="chat-menu-anchor">
                       <button className="top-settings-button" aria-label="Export conversation" title="Export conversation" onClick={() => setChatMenuOpen((open) => !open)}><Download size={17} /></button>
@@ -1066,9 +1313,15 @@ export default function App() {
                       {activeChat.messages.map((message, index) => {
                         const isLastAssistant = message.role === "assistant" && index === activeChat.messages.length - 1;
                         const waiting = streamingChatId === activeChat.id && isLastAssistant && !message.content;
-                        const messageProvider = message.provider && message.model
-                          ? `${getProvider(message.provider).name} · ${message.model}`
-                          : undefined;
+                                      const messageProvider = message.provider && message.model
+                                        ? `${getProviderName(message.provider, customProviders)} · ${(() => {
+                                            try {
+                                              return getChatModel(message.provider, message.model, customProviders).name;
+                                            } catch {
+                                              return message.model;
+                                            }
+                                          })()}`
+                                        : undefined;
                         return (
                           <article className={`message message-${message.role}`} key={message.id}>
                             {message.role === "assistant" && <div className="assistant-avatar"><Sparkles size={15} /></div>}
@@ -1124,6 +1377,9 @@ export default function App() {
                                   </button>}
                                   {isLastAssistant && !isStreaming && <button onClick={() => regenerate(activeChat)} aria-label="Regenerate response" title="Regenerate response">
                                     <RotateCcw size={14} /><span>{message.failure ? "Retry" : "Regenerate"}</span>
+                                  </button>}
+                                  {isLastAssistant && message.failure && !isStreaming && <button onClick={() => { setError(""); setModelPickerOpen(true); }} aria-label="Switch model" title="Choose a different model">
+                                    <ChevronDown size={14} /><span>Switch model</span>
                                   </button>}
                                 </div>
                               )}
@@ -1196,7 +1452,7 @@ export default function App() {
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={handleComposerKeyDown}
-                    placeholder={`Message ${getProvider(currentProvider).name}…`}
+                    placeholder={`Message ${getProviderName(currentProvider, customProviders)}…`}
                     aria-label="Message Morrow"
                     disabled={isStreaming || !settingsReady}
                   />
@@ -1207,7 +1463,7 @@ export default function App() {
                       </button>
                       <input ref={fileInputRef} className="sr-only" type="file" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf,text/*,.txt,.md,.csv,.json,.html,.css,.js,.ts,.py,.yaml,.yml" multiple onChange={(event) => void handleFiles(event)} />
                       <button className="composer-model" onClick={() => setModelPickerOpen(true)} disabled={isStreaming}>
-                        <span className="provider-dot" style={{ backgroundColor: getProvider(currentProvider).color }} />{activeModel.name}<ChevronDown size={13} />
+                        <span className="provider-dot" style={{ backgroundColor: getProviderColor(currentProvider, customProviders) }} />{activeModel.name}<ChevronDown size={13} />
                       </button>
                       {pendingAttachments.some((item) => item.kind === "image") && <span className="image-ready"><ImageIcon size={13} /> Vision</span>}
                     </div>
@@ -1279,6 +1535,7 @@ export default function App() {
       {settingsOpen && settingsReady && (
         <SettingsDialog
           settings={settings}
+          customProviders={customProviders}
           keys={keys}
           vaultMetadata={vaultMetadata}
           vaultUnlocked={Boolean(vaultKey)}
@@ -1293,6 +1550,12 @@ export default function App() {
           onDeleteKey={deleteKey}
           onExport={exportBackup}
           onWipe={wipeData}
+          onSaveCustomProvider={saveCustomProvider}
+          onDeleteCustomProvider={deleteCustomProvider}
+          onTestCustomProvider={testCustomProviderConnection}
+          onFetchCustomModels={fetchModelsForProvider}
+          onImportCustomProviders={importCustomProviderConfig}
+          onExportCustomProviders={exportCustomProviderConfig}
         />
       )}
 

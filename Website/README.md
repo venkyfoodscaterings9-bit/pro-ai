@@ -28,12 +28,14 @@ npm run preview
 - Smart Output Format detects requested file types, adds a per-request instruction, and creates downloadable Excel, CSV, HTML, PDF, Word, PowerPoint, Markdown, JSON, TXT, and PNG chart files in the browser. Generated files are saved with their conversation and listed in **Files**.
 - Choose an output format next to Send to override detection, or set a default format and confirmation preference in Settings. HTML previews run in a sandboxed iframe with scripts and external resources removed.
 - API keys encrypted in IndexedDB using the vault passphrase. The unlocked vault key stays in page memory until you lock it or close/reload the app; unlocking does not persist across a reload.
+- Add custom OpenAI-, Anthropic-, or Gemini-compatible providers in **Settings → Models & Providers**, register or fetch model IDs, then select enabled models in chat. Custom API keys use the same encrypted browser vault.
+- Export and import custom provider/model configuration as JSON. API keys are excluded by default; choosing to include them writes plaintext keys into the downloaded file.
 
 ## Connect a provider
 
-Open **Settings → API keys**, create a vault passphrase, and add an API key for a supported provider. Select a provider and model from the chat header. Model availability can vary by key, region, and provider lifecycle; check the provider's current model catalog.
+Open **Settings → API keys**, create a vault passphrase, and add an API key for a built-in provider. To connect a custom endpoint, unlock the vault and use **Settings → Models & Providers** to add its name, base URL, API format, key, and model IDs. Select an enabled provider/model from the chat header. Model availability can vary by key, region, and provider lifecycle; check the provider's current model catalog.
 
-The app sends requests directly from the browser to the selected provider; no proxy or app server is included. This requires a browser/network path that permits direct provider API requests. The app does not silently switch providers unless a configured fallback is available.
+The app sends requests directly from the browser to the selected provider; no proxy or app server is included. This requires a browser/network path that permits direct provider API requests. If a provider blocks browser requests with CORS, a backend proxy will be needed; this project does not currently include one. The app does not silently switch custom providers.
 
 Smart Output Format uses the selected provider's existing chat request. Provider CORS restrictions can still block that request; generated files themselves are built locally in the browser and do not require a backend.
 
